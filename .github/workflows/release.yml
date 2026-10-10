@@ -1,0 +1,110 @@
+name: Release HookXbud
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+      - name: Check version tag
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = [regex]::Match((Get-Content build.gradle.kts -Raw), 'versionName = "([^"]+)"').Groups[1].Value
+          if (!$version -or $version -notmatch '^\d+\.\d+\.\d+$') { throw 'Expected a numeric versionName.' }
+          if ($env:RELEASE_TAG -ne "v$version") { throw "Tag must match versionName: v$version" }
+          "HOOK_VERSION=$version" >> $env:GITHUB_ENV
+      - name: Prepare Android SDK
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manager = Join-Path $env:ANDROID_HOME 'cmdline-tools/latest/lib/sdkmanager-classpath.jar'
+          if (!(Test-Path $manager)) { throw 'Android SDK command-line tools are missing.' }
+          & java -classpath $manager com.android.sdklib.tool.sdkmanager.SdkManagerCli --sdk_root=$env:ANDROID_HOME 'platforms;android-37.0' 'build-tools;37.0.0' 'platform-tools'
+          if ($LASTEXITCODE -ne 0) { throw 'Android SDK installation failed.' }
+      - name: Restore signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.HOOK_KEYSTORE_BASE64 }}
+          HOOK_KEYSTORE_PASSWORD: ${{ secrets.HOOK_KEYSTORE_PASSWORD }}
+          HOOK_KEY_ALIAS: ${{ secrets.HOOK_KEY_ALIAS }}
+          HOOK_KEY_PASSWORD: ${{ secrets.HOOK_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('KEYSTORE_BASE64','HOOK_KEYSTORE_PASSWORD','HOOK_KEY_ALIAS','HOOK_KEY_PASSWORD')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "Missing signing secret: $name" }
+          }
+          $storePath = Join-Path $env:RUNNER_TEMP 'hook-release.p12'
+          [IO.File]::WriteAllBytes($storePath, [Convert]::FromBase64String($env:KEYSTORE_BASE64))
+          "HOOK_KEYSTORE_PATH=$storePath" >> $env:GITHUB_ENV
+      - name: Test, lint and build HookXbud
+        env:
+          HOOK_KEYSTORE_PASSWORD: ${{ secrets.HOOK_KEYSTORE_PASSWORD }}
+          HOOK_KEY_ALIAS: ${{ secrets.HOOK_KEY_ALIAS }}
+          HOOK_KEY_PASSWORD: ${{ secrets.HOOK_KEY_PASSWORD }}
+        run: |
+          & ./gradlew.ps1 lintDebug assembleRelease assembleDebug --no-daemon --console=plain
+          if ($LASTEXITCODE -ne 0) { throw 'Gradle verification failed.' }
+          & ./scripts/package.ps1 -Version $env:HOOK_VERSION
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: HookXbud-${{ env.HOOK_VERSION }}
+          path: |
+            dist/*.apk
+            dist/SHA256SUMS
+            build/outputs/mapping/release/mapping.txt
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $assets = @(Get-ChildItem -LiteralPath dist -File | Where-Object { $_.Extension -eq '.apk' -or $_.Name -eq 'SHA256SUMS' } | ForEach-Object FullName)
+          & gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            & gh release upload $tag @assets --repo $env:GITHUB_REPOSITORY --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'GitHub release asset upload failed.' }
+            & gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --latest
+          } else {
+            $notes = "docs/releases/$env:HOOK_VERSION.md"
+            $arguments = @('release', 'create', $tag) + $assets + @('--repo', $env:GITHUB_REPOSITORY, '--verify-tag', '--title', "HookXbud $env:HOOK_VERSION")
+            if (Test-Path $notes) { $arguments += @('--notes-file', $notes) } else { $arguments += '--generate-notes' }
+            & gh @arguments
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release publication failed.' }
+      - name: Remove temporary signing key
+        if: always()
+        run: |
+          $storePath = Join-Path $env:RUNNER_TEMP 'hook-release.p12'
+          if (Test-Path -LiteralPath $storePath) { Remove-Item -LiteralPath $storePath -Force }

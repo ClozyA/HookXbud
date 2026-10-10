@@ -1,0 +1,4 @@
+HOOK_KEYSTORE_PATH=signing/hookxbud-release.p12
+HOOK_KEYSTORE_PASSWORD=replace-me
+HOOK_KEY_ALIAS=hookxbud
+HOOK_KEY_PASSWORD=replace-me
